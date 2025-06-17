@@ -303,6 +303,11 @@ class Llama4TextConfig(PretrainedConfig):
         attn_temperature_tuning=True,
         floor_scale=8192,
         attn_scale=0.1,
+        #### MODIFIED ####
+        last_global_attention_layer=None,
+        last_local_attention_layer=None,
+        attention_windows=None,
+        #### MODIFIED ####
         **kwargs,
     ):
         super().__init__(
@@ -344,6 +349,12 @@ class Llama4TextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
+
+        #### MODIFIED ####
+        self.last_global_attention_layer = last_global_attention_layer
+        self.last_local_attention_layer =  last_local_attention_layer
+        self.attention_windows = attention_windows
+        #### MODIFIED ####
 
         # Backwards compatibility
         if no_rope_layers == []:

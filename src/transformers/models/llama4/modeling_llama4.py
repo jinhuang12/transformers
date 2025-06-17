@@ -90,6 +90,23 @@ class Llama4TextMLP(nn.Module):
         down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.down_proj(down_proj)
 
+##### MODIFIED ######
+class Llama4TextSReluMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
+        super().__init__()
+
+        if intermediate_size is None:
+            intermediate_size = config.intermediate_size
+
+        self.config = config
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.activation_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.activation_fn(self.gate_proj(x))
+        return self.down_proj(down_proj)
+##### MODIFIED ######
 
 class Llama4TextL2Norm(torch.nn.Module):
     def __init__(self, eps: float = 1e-6):
@@ -274,6 +291,7 @@ class Llama4TextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.has_cache_layer = layer_idx > max(config.last_global_attention_layer, config.last_local_attention_layer) # MODIFIED
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
@@ -288,12 +306,15 @@ class Llama4TextAttention(nn.Module):
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
+        ##### MODIFIED ######
+        if not self.has_cache_layer:
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+        ##### MODIFIED ######    
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -370,6 +391,10 @@ class Llama4TextDecoderLayer(nn.Module):
         self.is_moe_layer = layer_idx in config.moe_layers
         if self.is_moe_layer:  # the 128E model interleaves dense / sparse
             self.feed_forward = Llama4TextMoe(config)
+        ##### MODIFIED ######    
+        elif config.last_global_attention_layer:
+            self.feed_forward = Llama4TextSReluMLP(config, intermediate_size=config.intermediate_size_mlp)
+        ##### MODIFIED ######    
         else:
             self.feed_forward = Llama4TextMLP(config, intermediate_size=config.intermediate_size_mlp)
 

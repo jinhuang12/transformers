@@ -1,4 +1,5 @@
 import argparse
+import ast
 import gc
 import io
 import json
@@ -90,6 +91,26 @@ ORIGINAL_TO_CONVERTED_KEY_MAPPING = {
 }
 # fmt: on
 
+def extract_layer_index(layer_name: str) -> int:
+    """
+    Extract the layer index from the module name.
+    Examples:
+    - "encoder.layers.0" -> 0
+    - "encoder.layers.1.self_attn" -> 1
+    - "2.self_attn" -> 2
+    - "model.encoder.layers.0.sub.1" -> ValueError
+    """
+    subnames = layer_name.split(".")
+    int_vals: list[int] = []
+    for subname in subnames:
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    assert len(int_vals) == 1, (f"layer name {layer_name} should"
+                                " only contain one integer")
+    return int_vals[0]
+
 
 def convert_old_keys_to_new_keys(state_dict_keys: Optional[dict] = None):
     """
@@ -168,7 +189,7 @@ def get_concat_dim(key):
 
 
 def compute_intermediate_size(hidden_dim, ffn_exp=4, multiple_of=1024, ffn_dim_multiplier=1.2):
-    hidden_dim = ffn_exp * int(2 * hidden_dim / 3)
+    hidden_dim = int(ffn_exp * hidden_dim)
     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
@@ -188,9 +209,9 @@ def preprocess_keys(state_dict):
     for key, value in state_dict.items():
         if "mlp.fc1_weight" in key:
             prefix = key.split("mlp.fc1_weight")[0]
-            w1, w3 = value.chunk(2, dim=0)
-            new_state_dict[prefix + "w1.weight"] = w1
-            new_state_dict[prefix + "w3.weight"] = w3
+            # w1, w3 = value.chunk(2, dim=0)
+            new_state_dict[prefix + "w1.weight"] = value
+            # new_state_dict[prefix + "w3.weight"] = w3
         else:
             new_state_dict[key] = value
     return new_state_dict
@@ -239,6 +260,14 @@ def write_model(
     rope_theta = params["rope_theta"]
     no_rope_layer_interval = params["nope_layer_interval"]
     attention_chunk_size = params["attention_chunk_size"]
+    #### MODIFIED ####
+    hidden_act = 'silu'
+    if yoco_args := params["yoco_args"]:
+        last_global_attention_layer = yoco_args["kv_layers"][0]
+        last_local_attention_layer = yoco_args["kv_layers"][1]
+        attention_windows = ast.literal_eval(yoco_args["attention_window_schema"])
+        hidden_act = 'relu2'
+    #### MODIFIED ####
 
     config_kwargs = {}
     if params["use_scaled_rope"]:
@@ -277,8 +306,9 @@ def write_model(
         config_kwargs.update({"moe_layers": []})
 
     # Ensure all layers are rope if `nope_layer_interval` is None
-    no_rope_layer_interval = params["nope_layer_interval"]
-    no_rope_layer_interval = num_heads * 2 if no_rope_layer_interval is None else no_rope_layer_interval
+    if not yoco_args:    
+        no_rope_layer_interval = params["nope_layer_interval"]
+        no_rope_layer_interval = num_heads * 2 if no_rope_layer_interval is None else no_rope_layer_interval
 
     bos_token_id = 200000
     eos_token_id = [200001, 200007, 200008] if instruct else 200001
@@ -305,8 +335,14 @@ def write_model(
         tie_word_embeddings=False,  # Constant set to False
         torch_dtype=torch_dtype,
         for_llm_compressor=_OFFLINE_QUANT_COMPATIBLE,
+        hidden_act=hidden_act,
+        last_global_attention_layer=last_global_attention_layer,
+        last_local_attention_layer=last_local_attention_layer,
+        attention_windows=attention_windows,
         **config_kwargs,
     )
+
+    print(f'\nText Config: {text_config=}\n')
     # default vision config from params
 
     vision_params = params["vision_args"]
@@ -367,6 +403,9 @@ def write_model(
 
         print("Converting model...")
         all_keys = list(loaded[0].keys())
+        for key_name in all_keys:
+            print(f'{key_name}: {loaded[0].get(key_name).shape}')
+
         new_keys = convert_old_keys_to_new_keys(all_keys)
         state_dict = {}
         replicated_params = []  # To keep track of replicated weights.
@@ -388,24 +427,33 @@ def write_model(
 
             # Post-process the current_parameter.
             if "qkv_proj" in new_key:
-                queries = []
-                keys = []
-                values = []
-                for param in current_parameter:
-                    query, key_, value = param.split(
-                        [
-                            num_heads * dim_per_head // num_shards,
-                            num_key_value_heads * dim_per_head // num_shards,
-                            num_key_value_heads * dim_per_head // num_shards,
-                        ]
-                    )
-                    queries.append(query.reshape(num_heads_per_shard, -1, dim))
-                    keys.append(key_.reshape(num_key_value_heads // num_shards, -1, dim))
-                    values.append(value.reshape(num_key_value_heads // num_shards, -1, dim))
+                layer_idx = extract_layer_index(new_key)
+                has_cache_layer = layer_idx > max(text_config.last_global_attention_layer, text_config.last_local_attention_layer)
 
-                queries = torch.cat(queries, dim=0).reshape(dim, dim)
-                keys = torch.cat(keys, dim=0).reshape(num_key_value_heads * dim_per_head, dim)
-                values = torch.cat(values, dim=0).reshape(num_key_value_heads * dim_per_head, dim)
+                queries = []
+                if has_cache_layer: 
+                    print(f'{current_parameter[0].shape=}\n')
+                    query = current_parameter[0]
+                    queries.append(query.reshape(num_heads_per_shard, -1, dim))
+                    queries = torch.cat(queries, dim=0).reshape(dim, dim)
+                else:
+                    keys = []
+                    values = []
+                    for param in current_parameter:
+                        query, key_, value = param.split(
+                            [
+                                num_heads * dim_per_head // num_shards,
+                                num_key_value_heads * dim_per_head // num_shards,
+                                num_key_value_heads * dim_per_head // num_shards,
+                            ]
+                        )
+                        queries.append(query.reshape(num_heads_per_shard, -1, dim))
+                        keys.append(key_.reshape(num_key_value_heads // num_shards, -1, dim))
+                        values.append(value.reshape(num_key_value_heads // num_shards, -1, dim))
+
+                    queries = torch.cat(queries, dim=0).reshape(dim, dim)
+                    keys = torch.cat(keys, dim=0).reshape(num_key_value_heads * dim_per_head, dim)
+                    values = torch.cat(values, dim=0).reshape(num_key_value_heads * dim_per_head, dim)
                 # queries = permute_for_rope(queries, num_heads, dim, dim)
                 # keys = permute_for_rope(keys, num_key_value_heads, num_key_value_heads*dim_per_head, dim)
 
@@ -413,13 +461,14 @@ def write_model(
                 tqdm.write(f"Processing: {key.ljust(50)}  ->\t {q}, {queries.shape}")
                 state_dict[q] = queries
 
-                k = new_key.replace("qkv", "k")
-                tqdm.write(f"Processing: {key.ljust(50)}  ->\t {k}, {keys.shape}")
-                state_dict[k] = keys
+                if not has_cache_layer:
+                    k = new_key.replace("qkv", "k")
+                    tqdm.write(f"Processing: {key.ljust(50)}  ->\t {k}, {keys.shape}")
+                    state_dict[k] = keys
 
-                v = new_key.replace("qkv", "v")
-                tqdm.write(f"Processing: {key.ljust(50)}  ->\t {v}, {values.shape}")
-                state_dict[v] = values
+                    v = new_key.replace("qkv", "v")
+                    tqdm.write(f"Processing: {key.ljust(50)}  ->\t {v}, {values.shape}")
+                    state_dict[v] = values
             elif _OFFLINE_QUANT_COMPATIBLE and "feed_forward.experts." in new_key:
                 # for experts, we need to split expert for offline quantization purpose and don't need to fuse
                 expert_lists = []
@@ -514,7 +563,8 @@ def write_model(
         gc.collect()
 
         print("Loading the checkpoint in a Llama4 model.")
-        state_dict.pop("")
+        # state_dict.pop("")
+        # state_dict.pop("vision_projection.weight")
         model.load_state_dict(state_dict, strict=True, assign=True)
         print("Model reloaded successfully.")
         print("Saving the model.")
@@ -537,9 +587,9 @@ def write_model(
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        inputs = tokenizer(["Roses are red,"], return_tensors="pt").to(model.device)
-        out = model.generate(**inputs, max_new_tokens=4)
-        print(tokenizer.batch_decode(out))
+        # inputs = tokenizer(["Roses are red,"], return_tensors="pt").to(model.device)
+        # out = model.generate(**inputs, max_new_tokens=4)
+        # print(tokenizer.batch_decode(out))
     # generation config
     if instruct:
         print("Saving generation config...")
